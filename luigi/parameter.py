@@ -229,6 +229,8 @@ class Parameter(object):
 
         :param x: the value to serialize.
         """
+        if self.is_list:
+            return [str(v) for v in x]
         return str(x)
 
     def parse_from_input(self, param_name, x):
@@ -241,8 +243,8 @@ class Parameter(object):
         :raises MissingParameterException: if x is false-y and no default is specified.
         """
         if not x:
-            if self.has_default:
-                return self.default
+            if self.has_value:
+                return self.value
             elif self.is_boolean:
                 return False
             elif self.is_list:

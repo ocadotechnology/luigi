@@ -157,15 +157,78 @@ class CentralPlannerTest(unittest.TestCase):
         self.assertEqual(s['task_id'], 'A')
         self.assertEqual(s['worker'], 'X')
 
+    def test_scheduler_resources_none_allow_one(self):
+        self.sch.add_task(worker='X', task_id='A', resources={'R1': 1})
+        self.assertEqual(self.sch.get_work(worker='X')['task_id'], 'A')
+
+    def test_scheduler_resources_none_disallow_two(self):
+        self.sch.add_task(worker='X', task_id='A', resources={'R1': 2})
+        self.assertFalse(self.sch.get_work(worker='X')['task_id'], 'A')
+
+    def test_scheduler_with_insufficient_resources(self):
+        self.sch.add_task(worker='X', task_id='A', resources={'R1': 3})
+        self.sch.update_resources(R1=2)
+        self.assertFalse(self.sch.get_work(worker='X')['task_id'])
+
+    def test_scheduler_with_sufficient_resources(self):
+        self.sch.add_task(worker='X', task_id='A', resources={'R1': 3})
+        self.sch.update_resources(R1=3)
+        self.assertEqual(self.sch.get_work(worker='X')['task_id'], 'A')
+
+    def test_scheduler_with_resources_used(self):
+        self.sch.add_task(worker='X', task_id='A', resources={'R1': 1})
+        self.assertEqual(self.sch.get_work(worker='X')['task_id'], 'A')
+
+        self.sch.add_task(worker='Y', task_id='B', resources={'R1': 1})
+        self.sch.update_resources(R1=1)
+        self.assertFalse(self.sch.get_work(worker='Y')['task_id'])
+
+    def test_scheduler_overprovisioned_on_other_resource(self):
+        self.sch.add_task(worker='X', task_id='A', resources={'R1': 2})
+        self.sch.update_resources(R1=2)
+        self.assertEqual(self.sch.get_work(worker='X')['task_id'], 'A')
+
+        self.sch.add_task(worker='Y', task_id='B', resources={'R2': 2})
+        self.sch.update_resources(R1=1, R2=2)
+        self.assertEqual(self.sch.get_work(worker='Y')['task_id'], 'B')
+
+    def test_scheduler_with_priority_and_competing_resources(self):
+        self.sch.add_task(worker='X', task_id='A')
+        self.assertEqual(self.sch.get_work(worker='X')['task_id'], 'A')
+
+        self.sch.add_task(worker='X', task_id='B', resources={'R': 1}, priority=10)
+        self.sch.add_task(worker='Y', task_id='C', resources={'R': 1}, priority=1)
+        self.sch.update_resources(R=1)
+        self.assertFalse(self.sch.get_work(worker='Y')['task_id'])
+
+        self.sch.add_task(worker='Y', task_id='D', priority=0)
+        self.assertEqual(self.sch.get_work(worker='Y')['task_id'], 'D')
+
+    def test_update_resources(self):
+        self.sch.add_task(WORKER, task_id='A', deps=['B'])
+        self.sch.add_task(WORKER, task_id='B', resources={'r': 2})
+        self.sch.update_resources(r=1)
+
+        # B requires too many resources, we can't schedule
+        self.check_task_order([])
+
+        self.sch.add_task(WORKER, task_id='B', resources={'r': 1})
+
+        # now we have enough resources
+        self.check_task_order(['B', 'A'])
+
+    def check_task_order(self, order):
+        for expected_id in order:
+            self.assertEqual(self.sch.get_work(WORKER)['task_id'], expected_id)
+            self.sch.add_task(WORKER, expected_id, status=DONE)
+        self.assertEqual(self.sch.get_work(WORKER)['task_id'], None)
+
     def test_priorities(self):
         self.sch.add_task(WORKER, 'A', priority=10)
         self.sch.add_task(WORKER, 'B', priority=5)
         self.sch.add_task(WORKER, 'C', priority=15)
         self.sch.add_task(WORKER, 'D', priority=9)
-        for expected_id in ['C', 'A', 'D', 'B']:
-            self.assertEqual(self.sch.get_work(WORKER)['task_id'], expected_id)
-            self.sch.add_task(WORKER, expected_id, status=DONE)
-        self.assertEqual(self.sch.get_work(WORKER)['task_id'], None)
+        self.check_task_order(['C', 'A', 'D', 'B'])
 
     def test_priorities_default_and_negative(self):
         self.sch.add_task(WORKER, 'A', priority=10)
@@ -173,10 +236,7 @@ class CentralPlannerTest(unittest.TestCase):
         self.sch.add_task(WORKER, 'C', priority=15)
         self.sch.add_task(WORKER, 'D', priority=-20)
         self.sch.add_task(WORKER, 'E', priority=1)
-        for expected_id in ['C', 'A', 'E', 'B', 'D']:
-            self.assertEqual(self.sch.get_work(WORKER)['task_id'], expected_id)
-            self.sch.add_task(WORKER, expected_id, status=DONE)
-        self.assertEqual(self.sch.get_work(WORKER)['task_id'], None)
+        self.check_task_order(['C', 'A', 'E', 'B', 'D'])
 
     def test_priorities_and_dependencies(self):
         self.sch.add_task(WORKER, 'A', deps=['Z'], priority=10)
@@ -184,10 +244,65 @@ class CentralPlannerTest(unittest.TestCase):
         self.sch.add_task(WORKER, 'C', deps=['Z'], priority=3)
         self.sch.add_task(WORKER, 'D', priority=2)
         self.sch.add_task(WORKER, 'Z', priority=1)
-        for expected_id in ['B', 'D', 'Z', 'A', 'C']:
-            self.assertEqual(self.sch.get_work(WORKER)['task_id'], expected_id)
-            self.sch.add_task(WORKER, expected_id, status=DONE)
-        self.assertEqual(self.sch.get_work(WORKER)['task_id'], None)
+        self.check_task_order(['Z', 'A', 'B', 'C', 'D'])
+
+    def test_priority_update_dependency_after_scheduling(self):
+        self.sch.add_task(WORKER, 'A', priority=1)
+        self.sch.add_task(WORKER, 'B', priority=5, deps=['A'])
+        self.sch.add_task(WORKER, 'C', priority=10, deps=['B'])
+        self.sch.add_task(WORKER, 'D', priority=6)
+        self.check_task_order(['A', 'B', 'C', 'D'])
+
+    def test_priority_update_dependency_chain(self):
+        self.sch.add_task(WORKER, 'A', priority=10, deps=['B'])
+        self.sch.add_task(WORKER, 'B', priority=5, deps=['C'])
+        self.sch.add_task(WORKER, 'C', priority=1)
+        self.sch.add_task(WORKER, 'D', priority=6)
+        self.check_task_order(['C', 'B', 'A', 'D'])
+
+    def test_priority_no_decrease_with_multiple_updates(self):
+        self.sch.add_task(WORKER, 'A', priority=1)
+        self.sch.add_task(WORKER, 'B', priority=10, deps=['A'])
+        self.sch.add_task(WORKER, 'C', priority=5, deps=['A'])
+        self.sch.add_task(WORKER, 'D', priority=6)
+        self.check_task_order(['A', 'B', 'D', 'C'])
+
+    def test_unique_tasks(self):
+        self.sch.add_task(WORKER, 'A')
+        self.sch.add_task(WORKER, 'B')
+        self.sch.add_task(WORKER, 'C')
+        self.sch.add_task(WORKER + "_2", 'B')
+
+        response = self.sch.get_work(WORKER)
+        self.assertEqual(3, response['n_pending_tasks'])
+        self.assertEqual(2, response['n_unique_pending'])
+
+    def test_prefer_more_dependents(self):
+        self.sch.add_task(WORKER, 'A')
+        self.sch.add_task(WORKER, 'B')
+        self.sch.add_task(WORKER, 'C', deps=['B'])
+        self.sch.add_task(WORKER, 'D', deps=['B'])
+        self.sch.add_task(WORKER, 'E', deps=['A'])
+        self.check_task_order('BACDE')
+
+    def test_prefer_readier_dependents(self):
+        self.sch.add_task(WORKER, 'A')
+        self.sch.add_task(WORKER, 'B')
+        self.sch.add_task(WORKER, 'C')
+        self.sch.add_task(WORKER, 'D')
+        self.sch.add_task(WORKER, 'F', deps=['A', 'B', 'C'])
+        self.sch.add_task(WORKER, 'G', deps=['A', 'B', 'C'])
+        self.sch.add_task(WORKER, 'E', deps=['D'])
+        self.check_task_order('DABCFGE')
+
+    def test_ignore_done_dependents(self):
+        self.sch.add_task(WORKER, 'A')
+        self.sch.add_task(WORKER, 'B')
+        self.sch.add_task(WORKER, 'C')
+        self.sch.add_task(WORKER, 'D', priority=1)
+        self.sch.add_task(WORKER, 'E', deps=['C', 'D'])
+        self.sch.add_task(WORKER, 'F', deps=['A', 'B'])
+        self.check_task_order('DCABEF')
 
 
 if __name__ == '__main__':

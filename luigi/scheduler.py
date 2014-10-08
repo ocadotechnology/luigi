@@ -21,7 +21,7 @@ import cPickle as pickle
 import task_history as history
 logger = logging.getLogger("luigi.server")
 
-from task_status import PENDING, FAILED, DONE, RUNNING, UNKNOWN
+from task_status import PENDING, FAILED, DONE, RUNNING, SUSPENDED, UNKNOWN
 
 
 class Scheduler(object):
@@ -43,7 +43,7 @@ STATUS_TO_UPSTREAM_MAP = {FAILED: UPSTREAM_FAILED, RUNNING: UPSTREAM_RUNNING, PE
 
 
 class Task(object):
-    def __init__(self, status, deps, priority=0, family='', params={}):
+    def __init__(self, status, deps, resources={}, priority=0, family='', params={}):
         self.stakeholders = set()  # workers ids that are somehow related to this task (i.e. don't prune while any of these workers are still active)
         self.workers = set()  # workers ids that can perform task - task is 'BROKEN' if none of these workers are active
         if deps is None:
@@ -58,6 +58,7 @@ class Task(object):
         self.time_running = None  # Timestamp when picked up by worker
         self.expl = None
         self.priority = priority
+        self.resources = resources
         self.family = family
         self.params = params
 
@@ -87,7 +88,8 @@ class CentralPlannerScheduler(Scheduler):
     '''
 
     def __init__(self, retry_delay=900.0, remove_delay=600.0, worker_disconnect_delay=60.0,
-                 state_path='/var/lib/luigi-server/state.pickle', task_history=None):
+                 state_path='/var/lib/luigi-server/state.pickle', task_history=None,
+                 resources=None):
         '''
         (all arguments are in seconds)
         Keyword Arguments:
@@ -103,6 +105,7 @@ class CentralPlannerScheduler(Scheduler):
         self._worker_disconnect_delay = worker_disconnect_delay
         self._active_workers = {}  # map from id to a Worker object
         self._task_history = task_history or history.NopHistory()
+        self._resources = resources
 
     def dump(self):
         state = (self._tasks, self._active_workers)
@@ -187,16 +190,39 @@ class CentralPlannerScheduler(Scheduler):
             worker.reference = worker_reference
         worker.last_active = time.time()
 
-    def add_task(self, worker, task_id, status=PENDING, runnable=True, deps=None, expl=None, priority=0, family='', params={}):
+    def _update_priority(self, task, prio, worker):
+        """ Update priority of the given task
+
+        Priority can only be increased. If the task doesn't exist, a placeholder
+        task is created to preserve priority when the task is later scheduled.
+        """
+        task.priority = prio = max(prio, task.priority)
+        for dep in task.deps or []:
+            t = self._tasks[dep] # This should always exist, see add_task
+            if prio > t.priority:
+                self._update_priority(t, prio, worker)
+
+    def add_task(self, worker, task_id, status=PENDING, runnable=True,
+                 deps=None, new_deps=None, expl=None, resources=None,
+                 priority=0, family='', params={}):
         """
         * Add task identified by task_id if it doesn't exist
         * If deps is not None, update dependency list
         * Update status of task
         * Add additional workers/stakeholders
+        * Update priority when needed
         """
         self.update(worker)
 
-        task = self._tasks.setdefault(task_id, Task(status=PENDING, deps=deps, priority=priority, family=family, params=params))
+        task = self._tasks.setdefault(task_id, Task(
+            status=PENDING, deps=deps, resources=resources, priority=priority, family=family,
+            params=params))
+
+        # for setting priority, we'll sometimes create tasks with unset family and params
+        if not task.family:
+            task.family = family
+        if not task.params:
+            task.params = params
 
         if task.remove is not None:
             task.remove = None  # unmark task for removal so it isn't removed after being added
@@ -208,14 +234,26 @@ class CentralPlannerScheduler(Scheduler):
                 # We also check for status == PENDING b/c that's the default value
                 # (so checking for status != task.status woule lie)
                 self._update_task_history(task_id, status)
-            task.status = status
+            task.status = PENDING if status == SUSPENDED else status
             if status == FAILED:
                 task.retry = time.time() + self._retry_delay
 
         if deps is not None:
             task.deps = set(deps)
 
+        if new_deps is not None:
+            task.deps.update(new_deps)
+
         task.stakeholders.add(worker)
+        task.resources = resources
+
+        # Task dependencies might not exist yet. Let's create dummy tasks for them for now.
+        # Otherwise the task dependencies might end up being pruned if scheduling takes a long time
+        for dep in task.deps or []:
+            t = self._tasks.setdefault(dep, Task(status=UNKNOWN, deps=None, priority=priority))
+            t.stakeholders.add(worker)
+
+        self._update_priority(task, priority, worker)
 
         if runnable:
             task.workers.add(worker)
@@ -226,27 +264,76 @@ class CentralPlannerScheduler(Scheduler):
     def add_worker(self, worker, info):
         self._active_workers[worker].add_info(info)
 
+    def update_resources(self, **resources):
+        if self._resources is None:
+            self._resources = {}
+        self._resources.update(resources)
+
+    def _has_resources(self, needed_resources, used_resources):
+        if needed_resources is None:
+            return True
+
+        available_resources = self._resources or {}
+        for resource, amount in needed_resources.items():
+            if amount + used_resources[resource] > available_resources.get(resource, 1):
+                return False
+        return True
+
+    def _used_resources(self):
+        used_resources = collections.defaultdict(int)
+        if self._resources is not None:
+            for task in self._tasks.itervalues():
+                if task.status == RUNNING and task.resources:
+                    for resource, amount in task.resources.items():
+                        used_resources[resource] += amount
+        return used_resources
+
+    def _rank(self, worker):
+        ''' Return worker's rank function for task scheduling '''
+        dependents = collections.defaultdict(int)
+        not_done = lambda t: t not in self._tasks or self._tasks[t].status != DONE
+        for task_id, task in self._tasks.iteritems():
+            if task.status != DONE:
+                deps = filter(not_done, task.deps)
+                inverse_num_deps = 1.0 / max(len(deps), 1)
+                for dep in deps:
+                    dependents[dep] += inverse_num_deps
+
+        return lambda (task_id, task): (task.priority, worker in task.workers, dependents[task_id], -task.time)
+
+    def _not_schedulable(self, task, used_resources):
+        return any((
+            task.status != PENDING,
+            any(dep not in self._tasks or self._tasks[dep].status != DONE for dep in task.deps),
+            not self._has_resources(task.resources, used_resources)
+        ))
+
     def get_work(self, worker, host=None):
         # TODO: remove any expired nodes
 
-        # Algo: iterate over all nodes, find the first node with no dependencies and highest priority
+        # Algo: iterate over all nodes, find the highest priority node no dependencies and available
+        # resources.
+
+        # Resource checking looks both at currently available resources and at which resources would
+        # be available if all running tasks died and we rescheduled all workers greedily. We do both
+        # checks in order to prevent a worker with many low-priority tasks from starving other
+        # workers with higher priority tasks that share the same resources.
 
         # TODO: remove tasks that can't be done, figure out if the worker has absolutely
         # nothing it can wait for
 
         # Return remaining tasks that have no FAILED descendents
         self.update(worker, {'host': host})
-        best_t = float('inf')
-        best_priority = float('-inf')
         best_task = None
         locally_pending_tasks = 0
         running_tasks = []
+        used_resources = self._used_resources()
+        potential_resources = collections.defaultdict(int)
+        potential_workers = set([worker])
+        n_unique_pending = 0
 
-        for task_id, task in self._tasks.iteritems():
-            if worker not in task.workers:
-                continue
-
-            if task.status == RUNNING:
+        for task_id, task in sorted(self._tasks.iteritems(), key=self._rank(worker), reverse=True):
+            if task.status == RUNNING and worker in task.workers:
                 # Return a list of currently running tasks to the client,
                 # makes it easier to troubleshoot
                 other_worker = self._active_workers[task.worker_running]
@@ -255,22 +342,22 @@ class CentralPlannerScheduler(Scheduler):
                     more_info.update(other_worker.info)
                 running_tasks.append(more_info)
 
-            if task.status != PENDING:
+            if task.status == PENDING and worker in task.workers:
+                locally_pending_tasks += 1
+                if len(task.workers) == 1:
+                    n_unique_pending += 1
+
+            if self._not_schedulable(task, potential_resources) or best_task:
                 continue
 
-            locally_pending_tasks += 1
-            ok = True
-            for dep in task.deps:
-                if dep not in self._tasks:
-                    ok = False
-                elif self._tasks[dep].status != DONE:
-                    ok = False
-
-            if ok:
-                if (-task.priority, task.time) < (-best_priority, best_t):
-                    best_t = task.time
-                    best_priority = task.priority
-                    best_task = task_id
+            if worker in task.workers and self._has_resources(task.resources, used_resources):
+                best_task = task_id
+            else:
+                # keep track of the resources used in greedy scheduling
+                for w in filter(lambda w: w not in potential_workers, task.workers):
+                    for resource, amount in (task.resources or {}).items():
+                        potential_resources[resource] += amount
+                    potential_workers.add(w)
 
         if best_task:
             t = self._tasks[best_task]
@@ -280,6 +367,7 @@ class CentralPlannerScheduler(Scheduler):
             self._update_task_history(best_task, RUNNING, host=host)
 
         return {'n_pending_tasks': locally_pending_tasks,
+                'n_unique_pending': n_unique_pending,
                 'task_id': best_task,
                 'running_tasks': running_tasks}
 
@@ -312,18 +400,22 @@ class CentralPlannerScheduler(Scheduler):
                         upstream_status_table[dep_id] = status
             return upstream_status_table[dep_id]
 
-    def _serialize_task(self, task_id):
+    def _serialize_task(self, task_id, include_deps=True):
         task = self._tasks[task_id]
-        return {
-            'deps': list(task.deps),
+        ret = {
             'status': task.status,
             'workers': list(task.workers),
             'worker_running': task.worker_running,
             'time_running': getattr(task, "time_running", None),
             'start_time': task.time,
             'params': task.params,
-            'name': task.family
+            'name': task.family,
+            'priority': task.priority,
+            'resources': task.resources,
         }
+        if include_deps:
+            ret['deps'] = list(task.deps)
+        return ret
 
     def graph(self):
         self.prune()
@@ -335,15 +427,23 @@ class CentralPlannerScheduler(Scheduler):
     def _recurse_deps(self, task_id, serialized):
         if task_id not in serialized:
             task = self._tasks.get(task_id)
-            if task is None:
+            if task is None or not task.family:
                 logger.warn('Missing task for id [%s]', task_id)
+
+                # try to infer family and params from task_id
+                try:
+                    family, _, param_str = task_id.rstrip(')').partition('(')
+                    params = dict(param.split('=') for param in param_str.split(', '))
+                except:
+                    family, params = '', {}
                 serialized[task_id] = {
                     'deps': [],
                     'status': UNKNOWN,
                     'workers': [],
                     'start_time': UNKNOWN,
-                    'params': task.params,
-                    'name': task.family
+                    'params': params,
+                    'name': family,
+                    'priority': 0,
                 }
             else:
                 serialized[task_id] = self._serialize_task(task_id)
@@ -366,7 +466,7 @@ class CentralPlannerScheduler(Scheduler):
             if not status or task.status == status:
                 if (task.status != PENDING or not upstream_status or
                     upstream_status == self._upstream_status(task_id, upstream_status_table)):
-                    serialized = self._serialize_task(task_id)
+                    serialized = self._serialize_task(task_id, False)
                     result[task_id] = serialized
         return result
 
@@ -396,7 +496,7 @@ class CentralPlannerScheduler(Scheduler):
         result = collections.defaultdict(dict)
         for task_id, task in self._tasks.iteritems():
             if task_id.find(task_str) != -1:
-                serialized = self._serialize_task(task_id)
+                serialized = self._serialize_task(task_id, False)
                 result[task.status][task_id] = serialized
         return result
 

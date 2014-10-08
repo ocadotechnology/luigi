@@ -17,6 +17,7 @@ import logging
 import parameter
 import warnings
 import traceback
+import pyparsing as pp
 
 Parameter = parameter.Parameter
 logger = logging.getLogger('luigi-interface')
@@ -38,19 +39,38 @@ def id_to_name_and_params(task_id):
         E.g. calling with ``Foo(bar=bar, baz=baz)`` returns
         ``('Foo', {'bar': 'bar', 'baz': 'baz'})``
     '''
-    lparen = task_id.index('(')
-    task_family = task_id[:lparen]
-    params = task_id[lparen + 1:-1]
+    name_chars = pp.alphanums + '_'
+    parameter = (
+        (pp.Word(name_chars) +
+         pp.Literal('=').suppress() +
+         ((pp.Literal('(').suppress() | pp.Literal('[').suppress()) +
+          pp.ZeroOrMore(pp.Word(name_chars) +
+                        pp.ZeroOrMore(pp.Literal(',')).suppress()) +
+          (pp.Literal(')').suppress() |
+           pp.Literal(']').suppress()))).setResultsName('list_params',
+                                                        listAllMatches=True) |
+        (pp.Word(name_chars) +
+         pp.Literal('=').suppress() +
+         pp.Word(name_chars)).setResultsName('params', listAllMatches=True))
 
-    def split_equals(x):
-        equals = x.index('=')
-        return x[:equals], x[equals + 1:]
-    if params:
-        param_list = map(split_equals, params.split(', '))  # TODO: param values with ', ' in them will break this
-    else:
-        param_list = []
-    return task_family, dict(param_list)
+    parser = (
+        pp.Word(name_chars).setResultsName('task') +
+        pp.Literal('(').suppress() +
+        pp.ZeroOrMore(parameter + (pp.Literal(',')).suppress()) +
+        pp.ZeroOrMore(parameter) +
+        pp.Literal(')').suppress())
 
+    parsed = parser.parseString(task_id).asDict()
+    task_name = parsed['task']
+
+    params = {}
+    if 'params' in parsed:
+        for k, v in parsed['params']:
+            params[k] = v
+    if 'list_params' in parsed:
+        for x in parsed['list_params']:
+            params[x[0]] = x[1:]
+    return task_name, params
 
 
 class Register(abc.ABCMeta):
@@ -158,6 +178,23 @@ class Register(abc.ABCMeta):
         return reg
 
     @classmethod
+    def tasks_str(cls):
+        """Human-readable register contents dump.
+        """
+        return repr(sorted(Register.get_reg().keys()))
+
+    @classmethod
+    def get_task_cls(cls, name):
+        """Returns an unambiguous class or raises an exception.
+        """
+        task_cls = Register.get_reg().get(name)
+        if not task_cls:
+            raise Exception('Task %r not found. Candidates are: %s' % (name, Register.tasks_str()))
+        if task_cls == Register.AMBIGUOUS_CLASS:
+            raise Exception('Task %r is ambiguous' % name)
+        return task_cls
+
+    @classmethod
     def get_global_params(cls):
         """Compiles and returns the global parameters for all :py:class:`Task`.
 
@@ -214,6 +251,10 @@ class Task(object):
     # Priority of the task: the scheduler should favor available
     # tasks with higher priority values first.
     priority = 0
+
+    # Resources used by the task. Should be formatted like {"scp": 1} to indicate that the
+    # task requires 1 unit of the scp resource.
+    resources = {}
 
     @classmethod
     def event_handler(cls, event):
@@ -401,7 +442,7 @@ class Task(object):
 
         if cls is None:
             cls = self.__class__
-        
+
         new_k = {}
         for param_name, param_class in cls.get_nonglobal_params():
             if param_name in k:
@@ -414,6 +455,9 @@ class Task(object):
 
     def __repr__(self):
         return self.task_id
+
+    def __eq__(self, other):
+        return self.__class__ == other.__class__ and self.param_args == other.param_args
 
     def complete(self):
         """
@@ -469,6 +513,14 @@ class Task(object):
         the superclass.
         '''
         return flatten(self.requires())  # base impl
+
+    def process_resources(self):
+        '''
+        Override in "template" tasks which provide common resource functionality
+        but allow subclasses to specify additional resources while preserving
+        the name for consistent end-user experience.
+        '''
+        return self.resources  # default impl
 
     def input(self):
         """Returns the outputs of the Tasks returned by :py:meth:`requires`

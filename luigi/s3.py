@@ -17,10 +17,8 @@ import os
 import os.path
 import random
 import tempfile
+import warnings
 import urlparse
-
-import boto
-from boto.s3.key import Key
 
 import configuration
 from ConfigParser import NoSectionError, NoOptionError
@@ -29,13 +27,22 @@ from luigi.target import FileSystem
 from luigi.target import FileSystemTarget
 from luigi.target import FileSystemException
 from luigi.task import ExternalTask
+from luigi.format import FileWrapper
+
+logger = logging.getLogger('luigi-interface')
+
+try:
+    import boto
+    from boto.s3.key import Key
+except ImportError:
+    logger.warning("Loading s3 module without boto installed. Will crash at runtime if s3 functionality is used.")
+
 
 # two different ways of marking a directory
 # with a suffix in S3
 S3_DIRECTORY_MARKER_SUFFIX_0 = '_$folder$'
 S3_DIRECTORY_MARKER_SUFFIX_1 = '/'
 
-logger = logging.getLogger('luigi-interface')
 
 class InvalidDeleteException(FileSystemException):
     pass
@@ -343,15 +350,27 @@ class S3Target(FileSystemTarget):
         if mode == 'r':
             s3_key = self.fs.get_key(self.path)
             if s3_key:
-                return ReadableS3File(s3_key)
+                fileobj = ReadableS3File(s3_key)
+                if self.format:
+                    tmp_path = tempfile.mktemp(prefix='luigi_s3_')
+                    with open(tmp_path, 'w') as f:
+                        f.write(fileobj.read())
+                    return self.format.pipe_reader(FileWrapper(open(tmp_path)))
+                return fileobj
             else:
-                raise FileNotFoundException("Could not find file at %s" % self.path)
+                raise FileNotFoundException(
+                    "Could not find file at %s" % self.path)
         else:
-            return AtomicS3File(self.path, self.fs)
+            if self.format:
+                return self.format.pipe_writer(
+                    AtomicS3File(self.path, self.fs))
+            else:
+                return AtomicS3File(self.path, self.fs)
 
-class S3EmrTarget(S3Target):
+
+class S3FlagTarget(S3Target):
     """
-    Defines a target directory for EMR output on S3
+    Defines a target directory with a flag-file (defaults to `_SUCCESS`) used to signify job success.
 
     This checks for two things:  that the path exists (just like the S3Target) and that the _SUCCESS file exists
     within the directory.  Because Hadoop outputs into a directory and not a single file, the path is assume to be a
@@ -363,16 +382,27 @@ class S3EmrTarget(S3Target):
 
     fs = None
 
-    def __init__(self, path, format=None, client=None):
+    def __init__(self, path, format=None, client=None, flag='_SUCCESS'):
         if path[-1] is not "/":
-            raise ValueError("S3EmrTarget requires the path to be to a directory.  It must end with a slash ( / ).")
+            raise ValueError("S3FlagTarget requires the path to be to a directory.  It must end with a slash ( / ).")
         super(S3Target, self).__init__(path)
         self.format = format
         self.fs = client or S3Client()
+        self.flag = flag
 
     def exists(self):
-        hadoopSemaphore = self.path + '_SUCCESS'
+        hadoopSemaphore = self.path + self.flag
         return self.fs.exists(hadoopSemaphore)
+
+
+class S3EmrTarget(S3FlagTarget):
+    """
+    Deprecated. Use :py:class:`S3FlagTarget`
+    """
+    def __init__(self, *args, **kwargs):
+        warnings.warn("S3EmrTarget is deprecated. Please use S3FlagTarget")
+        super(S3EmrTarget, self).__init__(*args, **kwargs)
+
 
 class S3PathTask(ExternalTask):
     """
@@ -392,3 +422,14 @@ class S3EmrTask(ExternalTask):
 
     def output(self):
         return S3EmrTarget(self.path)
+
+
+class S3FlagTask(ExternalTask):
+    """
+    An external task that requires the existence of EMR output in S3
+    """
+    path = Parameter()
+    flag = Parameter(default=None)
+
+    def output(self):
+        return S3FlagTarget(self.path, flag=self.flag)

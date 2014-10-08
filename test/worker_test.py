@@ -21,7 +21,10 @@ from helpers import with_config
 import unittest
 import logging
 import threading
+import os
+import signal
 import luigi.notifications
+import tempfile
 luigi.notifications.DEBUG = True
 
 
@@ -36,6 +39,17 @@ class DummyTask(Task):
     def run(self):
         logging.debug("%s - setting has_run", self.task_id)
         self.has_run = True
+
+
+class DynamicDummyTask(Task):
+    p = luigi.Parameter()
+
+    def output(self):
+        return luigi.LocalTarget(self.p)
+
+    def run(self):
+        with self.output().open('w') as f:
+            f.write('Done!')
 
 
 class WorkerTest(unittest.TestCase):
@@ -207,6 +221,32 @@ class WorkerTest(unittest.TestCase):
         self.assertTrue(a.complete())
         self.assertTrue(b.complete())
 
+    def test_dynamic_dependencies(self):
+
+        class DynamicRequires(Task):
+            p = luigi.Parameter()
+
+            def output(self):
+                return luigi.LocalTarget(os.path.join(self.p, 'parent'))
+
+            def run(self):
+                dummy_targets = yield [DynamicDummyTask(os.path.join(self.p, str(i)))
+                                     for i in range(5)]
+                dummy_targets += yield [DynamicDummyTask(os.path.join(self.p, str(i)))
+                                       for i in range(5, 7)]
+                with self.output().open('w') as f:
+                    for i, d in enumerate(dummy_targets):
+                        for line in d.open('r'):
+                            print >>f, '%d: %s' % (i, line.strip())
+
+        t = DynamicRequires(p=tempfile.mktemp())
+        luigi.build([t], local_scheduler=True)
+        self.assertTrue(t.complete())
+
+        # loop through output and verify
+        f = t.output().open('r')
+        for i in xrange(7):
+            self.assertEquals(f.readline().strip(), '%d: Done!' % i)
 
     def test_avoid_infinite_reschedule(self):
         class A(Task):
@@ -222,7 +262,6 @@ class WorkerTest(unittest.TestCase):
 
         self.assertTrue(self.w.add(B()))
         self.assertFalse(self.w.run())
-
 
     def test_interleaved_workers(self):
         class A(DummyTask):
@@ -311,8 +350,8 @@ class WorkerTest(unittest.TestCase):
 
         sch = CentralPlannerScheduler(retry_delay=100, remove_delay=1000, worker_disconnect_delay=10)
 
-        w  = Worker(scheduler=sch, worker_id='X', keep_alive=True)
-        w2 = Worker(scheduler=sch, worker_id='Y', keep_alive=True, wait_interval=0.1)
+        w  = Worker(scheduler=sch, worker_id='X', keep_alive=True, count_uniques=True)
+        w2 = Worker(scheduler=sch, worker_id='Y', keep_alive=True, count_uniques=True, wait_interval=0.1)
 
         self.assertTrue(w.add(a))
         self.assertTrue(w2.add(b))
@@ -324,6 +363,40 @@ class WorkerTest(unittest.TestCase):
         self.assertTrue(b.complete())
 
         w.stop()
+        w2.stop()
+
+    def test_die_for_non_unique_pending(self):
+        class A(DummyTask):
+            def run(self):
+                logging.debug('running A')
+                time.sleep(0.1)
+                super(A, self).run()
+
+        a = A()
+
+        class B(DummyTask):
+            def requires(self):
+                return a
+            def run(self):
+                logging.debug('running B')
+                super(B, self).run()
+
+        b = B()
+
+        sch = CentralPlannerScheduler(retry_delay=100, remove_delay=1000, worker_disconnect_delay=10)
+
+        w  = Worker(scheduler=sch, worker_id='X', keep_alive=True, count_uniques=True)
+        w2 = Worker(scheduler=sch, worker_id='Y', keep_alive=True, count_uniques=True, wait_interval=0.1)
+
+        self.assertTrue(w.add(b))
+        self.assertTrue(w2.add(b))
+
+        self.assertEquals(w._get_work()[0], 'A()')
+        self.assertTrue(w2.run())
+
+        self.assertFalse(a.complete())
+        self.assertFalse(b.complete())
+
         w2.stop()
 
     def test_complete_exception(self):
@@ -419,6 +492,7 @@ class WorkerPingThreadTests(unittest.TestCase):
         self.assertTrue(w._keep_alive_thread.is_alive())
         w.stop()  # should stop within 0.01 s
         self.assertFalse(w._keep_alive_thread.is_alive())
+
 
 EMAIL_CONFIG = {"core": {"error-email": "not-a-real-email-address-for-test-only"}}
 
@@ -524,6 +598,44 @@ class WorkerEmailTest(EmailTest):
         self.assertEquals(self.last_email, None)
         self.assertTrue(a.complete())
 
+
+class RaiseSystemExit(luigi.Task):
+    def run(self):
+        raise SystemExit("System exit!!")
+
+
+class SuicidalWorker(luigi.Task):
+    signal = luigi.IntParameter()
+    def run(self):
+        os.kill(os.getpid(), self.signal)
+
+
+class MultipleWorkersTest(unittest.TestCase):
+    def test_multiple_workers(self):
+        # Test using multiple workers
+        # Also test generating classes dynamically since this may reflect issues with
+        # various platform and how multiprocessing is implemented. If it's using os.fork
+        # under the hood it should be fine, but dynamic classses can't be pickled, so
+        # other implementations of multiprocessing (using spawn etc) may fail
+        class MyDynamicTask(luigi.Task):
+            x = luigi.Parameter()
+            def run(self):
+                time.sleep(0.1)
+
+        t0 = time.time()
+        luigi.build([MyDynamicTask(i) for i in xrange(100)], workers=100, local_scheduler=True)
+        self.assertTrue(time.time() < t0 + 5.0) # should ideally take exactly 0.1s, but definitely less than 10.0
+
+    def test_system_exit(self):
+        # This would hang indefinitely before this fix:
+        # https://github.com/spotify/luigi/pull/439
+        luigi.build([RaiseSystemExit()], workers=2, local_scheduler=True)
+
+    def test_term_worker(self):
+        luigi.build([SuicidalWorker(signal.SIGTERM)], workers=2, local_scheduler=True)
+
+    def test_kill_worker(self):
+        luigi.build([SuicidalWorker(signal.SIGKILL)], workers=2, local_scheduler=True)
 
 if __name__ == '__main__':
     unittest.main()
