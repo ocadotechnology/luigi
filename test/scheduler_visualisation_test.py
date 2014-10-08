@@ -55,20 +55,6 @@ class FactorTask(luigi.Task):
         return luigi.LocalTarget(os.path.join(tempdir, 'luigi_test_factor_%d' % self.product))
 
 
-class BadReqTask(luigi.Task):
-    succeed = luigi.BooleanParameter()
-
-    def requires(self):
-        assert self.succeed
-        yield BadReqTask(False)
-
-    def run(self):
-        pass
-
-    def complete(self):
-        return False
-
-
 class FailingTask(luigi.Task):
     task_id = luigi.Parameter()
 
@@ -177,19 +163,6 @@ class SchedulerVisualisationTest(unittest.TestCase):
         d5 = dep_graph[u'FactorTask(product=5)']
         self.assertEqual(sorted(d5[u'deps']), [])
 
-    def test_dep_graph_missing_deps(self):
-        self._build([BadReqTask(True)])
-        dep_graph = self._remote().dep_graph('BadReqTask(succeed=True)')
-        self.assertEqual(len(dep_graph), 2)
-
-        suc = dep_graph[u'BadReqTask(succeed=True)']
-        self.assertEqual(suc[u'deps'], [u'BadReqTask(succeed=False)'])
-
-        fail = dep_graph[u'BadReqTask(succeed=False)']
-        self.assertEqual(fail[u'name'], 'BadReqTask')
-        self.assertEqual(fail[u'params'], {'succeed': 'False'})
-        self.assertEqual(fail[u'status'], 'UNKNOWN')
-
     def test_dep_graph_diamond(self):
         self._build([FactorTask(12)])
         remote = self._remote()
@@ -218,6 +191,7 @@ class SchedulerVisualisationTest(unittest.TestCase):
 
         t7 = tasks_done.get(u'FactorTask(product=7)')
         self.assertEqual(type(t7), type({}))
+        self.assertEqual(t7[u'deps'], [])
 
         self.assertEqual(remote.task_list('', ''), tasks_done)
         self.assertEqual(remote.task_list('FAILED', ''), {})
@@ -231,6 +205,7 @@ class SchedulerVisualisationTest(unittest.TestCase):
 
         f8 = failed.get(u'FailingTask(task_id=8)')
         self.assertEqual(f8[u'status'], u'FAILED')
+        self.assertEqual(f8[u'deps'], [])
 
         self.assertEqual(remote.task_list('DONE', ''), {})
         self.assertEqual(remote.task_list('PENDING', ''), {})
@@ -265,26 +240,31 @@ class SchedulerVisualisationTest(unittest.TestCase):
         done = remote.task_list('DONE', '')
         self.assertEqual(len(done), 1)
         db = done.get('B()')
+        self.assertEqual(db['deps'], [])
         self.assertEqual(db['status'], 'DONE')
 
         missing_input = remote.task_list('PENDING', 'UPSTREAM_MISSING_INPUT')
         self.assertEqual(len(missing_input), 2)
 
         pa = missing_input.get(u'A()')
+        self.assertEqual(pa['deps'], [])
         self.assertEqual(pa['status'], 'PENDING')
         self.assertEqual(remote._upstream_status('A()', {}), 'UPSTREAM_MISSING_INPUT')
 
         pc = missing_input.get(u'C()')
+        self.assertEqual(sorted(pc['deps']), ['A()', 'B()'])
         self.assertEqual(pc['status'], 'PENDING')
         self.assertEqual(remote._upstream_status('C()', {}), 'UPSTREAM_MISSING_INPUT')
 
         upstream_failed = remote.task_list('PENDING', 'UPSTREAM_FAILED')
         self.assertEqual(len(upstream_failed), 2)
         pe = upstream_failed.get(u'E()')
+        self.assertEqual(sorted(pe['deps']), ['C()', 'D()'])
         self.assertEqual(pe['status'], 'PENDING')
         self.assertEqual(remote._upstream_status('E()', {}), 'UPSTREAM_FAILED')
 
         pe = upstream_failed.get(u'D()')
+        self.assertEqual(sorted(pe['deps']), ['F()'])
         self.assertEqual(pe['status'], 'PENDING')
         self.assertEqual(remote._upstream_status('D()', {}), 'UPSTREAM_FAILED')
 
@@ -296,6 +276,7 @@ class SchedulerVisualisationTest(unittest.TestCase):
         failed = remote.task_list('FAILED', '')
         self.assertEqual(len(failed), 1)
         fd = failed.get('F()')
+        self.assertEqual(fd['deps'], [])
         self.assertEqual(fd['status'], 'FAILED')
 
         all = dict(pending)

@@ -27,6 +27,7 @@ import re
 import argparse
 import sys
 import os
+
 from task import Register
 
 
@@ -55,33 +56,6 @@ def setup_interface_logging(conf_file=None):
 def get_config():
     warnings.warn('Use luigi.configuration.get_config() instead')
     return configuration.get_config()
-
-
-def load_task(parent_task, task_name, params):
-    """ Imports task and uses ArgParseInterface to initialize it
-    """
-    # How the module is represented depends on if Luigi was started from
-    # that file or if the module was imported later on
-    module = sys.modules[parent_task.__module__]
-    if module.__name__ == '__main__':
-        parent_module_path = os.path.abspath(module.__file__)
-        for p in sys.path:
-            if parent_module_path.startswith(p):
-                end = parent_module_path.rfind('.py')
-                actual_module = parent_module_path[len(p):end].strip(
-                    '/').replace('/', '.')
-                break
-    else:
-        actual_module = module.__name__
-    return init_task(actual_module, task_name, params, {})
-
-
-def init_task(module_name, task, str_params, global_str_params):
-    __import__(module_name)
-    module = sys.modules[module_name]
-    Task = getattr(module, task)
-
-    return Task.from_str_params(str_params, global_str_params)
 
 
 class EnvironmentParamsContainer(task.Task):
@@ -321,7 +295,10 @@ class ArgParseInterface(Interface):
         if main_task_cls:
             task_cls = main_task_cls
         else:
-            task_cls = Register.get_task_cls(args.command)
+            task_cls = Register.get_reg()[args.command]
+
+        if task_cls == Register.AMBIGUOUS_CLASS:
+            raise Exception('%s is ambigiuous' % args.command)
 
         # Notice that this is not side effect free because it might set global params
         task = task_cls.from_str_params(params, Register.get_global_params())
@@ -385,19 +362,20 @@ class OptParseInterface(Interface):
         global_params = list(Register.get_global_params())
 
         parser = PassThroughOptionParser()
+        tasks_str = '/'.join(sorted([name for name in Register.get_reg()]))
 
         def add_task_option(p):
             if main_task_cls:
-                p.add_option('--task', help='Task to run (one of ' + Register.tasks_str() + ') [default: %default]', default=main_task_cls.task_family)
+                p.add_option('--task', help='Task to run (' + tasks_str + ') [default: %default]', default=main_task_cls.task_family)
             else:
-                p.add_option('--task', help='Task to run (one of %s)' % Register.tasks_str())
+                p.add_option('--task', help='Task to run (%s)' % tasks_str)
 
         def _add_parameter(parser, param_name, param):
             description = [param_name]
             if param.description:
                 description.append(param.description)
-            if param.has_value:
-                description.append(" [default: %s]" % (param.value,))
+            if param.has_default:
+                description.append(" [default: %s]" % (param.default,))
 
             if param.is_list:
                 action = "append"
@@ -423,9 +401,14 @@ class OptParseInterface(Interface):
             parser = optparse.OptionParser()
         add_task_option(parser)
 
-        task_cls = Register.get_task_cls(task_cls_name)
+        if task_cls_name not in Register.get_reg():
+            raise Exception('Error: %s is not a valid tasks (must be %s)' % (task_cls_name, tasks_str))
 
         # Register all parameters as a big mess
+        task_cls = Register.get_reg()[task_cls_name]
+        if task_cls == Register.AMBIGUOUS_CLASS:
+            raise Exception('%s is ambiguous' % task_cls_name)
+
         params = task_cls.get_nonglobal_params()
 
         for param_name, param in global_params:

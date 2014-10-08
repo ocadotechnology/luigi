@@ -34,7 +34,6 @@ import configuration
 import warnings
 import mrrunner
 import json
-import glob
 
 logger = logging.getLogger('luigi-interface')
 
@@ -86,25 +85,16 @@ def create_packages_archive(packages, filename):
     def add(src, dst):
         logger.debug('adding to tar: %s -> %s', src, dst)
         tar.add(src, dst)
-
-    def add_files_for_package(sub_package_path, root_package_path, root_package_name):
-        for root, dirs, files in os.walk(sub_package_path):
-            if '.svn' in dirs:
-                dirs.remove('.svn')
-            for f in files:
-                if not f.endswith(".pyc") and not f.startswith("."):
-                    add(dereference(root + "/" + f), root.replace(root_package_path, root_package_name) + "/" + f)
-
     for package in packages:
         # Put a submodule's entire package in the archive. This is the
         # magic that usually packages everything you need without
         # having to attach packages/modules explicitly
-        if not getattr(package, "__path__", None) and '.' in package.__name__:
+        if not hasattr(package, "__path__") and '.' in package.__name__:
             package = __import__(package.__name__.rpartition('.')[0], None, None, 'non_empty')
 
         n = package.__name__.replace(".", "/")
 
-        if getattr(package, "__path__", None):
+        if hasattr(package, "__path__"):
             # TODO: (BUG) picking only the first path does not
             # properly deal with namespaced packages in different
             # directories
@@ -127,17 +117,12 @@ def create_packages_archive(packages, filename):
                     add(dereference(__import__(module_name, None, None, 'non_empty').__path__[0] + "/__init__.py"),
                         directory + "/__init__.py")
 
-                add_files_for_package(p, p, n)
-
-                # include egg-info directories that are parallel:
-                for egg_info_path in glob.glob(p + '*.egg-info'):
-                    logger.debug(
-                        'Adding package metadata to archive for "%s" found at "%s"',
-                        package.__name__,
-                        egg_info_path
-                    )
-                    add_files_for_package(egg_info_path, p, n)
-
+                for root, dirs, files in os.walk(p):
+                    if '.svn' in dirs:
+                        dirs.remove('.svn')
+                    for f in files:
+                        if not f.endswith(".pyc") and not f.startswith("."):
+                            add(dereference(root + "/" + f), root.replace(p, n) + "/" + f)
         else:
             f = package.__file__
             if f.endswith("pyc"):
@@ -438,7 +423,7 @@ class HadoopJobRunner(JobRunner):
         run_and_track_hadoop_job(arglist)
 
         # rename temporary work directory to given output
-        tmp_target.move(output_final, raise_if_exists=True)
+        tmp_target.move(output_final, fail_if_exists=True)
         self.finish()
 
     def finish(self):
@@ -533,16 +518,12 @@ class BaseHadoopJobTask(luigi.Task):
     final_combiner = NotImplemented
     final_reducer = NotImplemented
 
-    mr_priority = NotImplemented
-
     _counter_dict = {}
     task_id = None
 
     def jobconfs(self):
         jcs = []
         jcs.append('mapred.job.name=%s' % self.task_id)
-        if self.mr_priority != NotImplemented:
-            jcs.append('mapred.job.priority=%s' % self.mr_priority())
         pool = self.pool
         if pool is not None:
             # Supporting two schedulers: fair (default) and capacity using the same option
