@@ -19,7 +19,6 @@ import json
 import time
 import warnings
 from scheduler import Scheduler, PENDING
-import configuration
 
 logger = logging.getLogger('luigi-interface')  # TODO: 'interface'?
 
@@ -36,47 +35,28 @@ class RemoteScheduler(Scheduler):
     def __init__(self, host='localhost', port=8082, connect_timeout=None):
         self._host = host
         self._port = port
-
-        config = configuration.get_config()
-
-        if connect_timeout is None:
-            connect_timeout = config.getfloat('core', 'rpc-connect-timeout', 10.0)
         self._connect_timeout = connect_timeout
 
     def _wait(self):
         time.sleep(30)
 
-    def _get(self, url, data):
-        url = 'http://%s:%d%s?%s' % \
-              (self._host, self._port, url, urllib.urlencode(data))
-        return urllib2.Request(url)
-
-    def _post(self, url, data):
-        url = 'http://%s:%d%s' % (self._host, self._port, url)
-        return urllib2.Request(url, urllib.urlencode(data))
-
     def _request(self, url, data, log_exceptions=True, attempts=3):
+        # TODO(erikbern): do POST requests instead
         data = {'data': json.dumps(data)}
+        url = 'http://%s:%d%s?%s' % \
+            (self._host, self._port, url, urllib.urlencode(data))
 
-        req = self._post(url, data)
+        req = urllib2.Request(url)
         last_exception = None
-        attempt = 0
-        while attempt < attempts:
-            attempt += 1
+        for attempt in xrange(attempts):
             if last_exception:
                 logger.info("Retrying...")
                 self._wait()  # wait for a bit and retry
             try:
                 response = urllib2.urlopen(req, None, self._connect_timeout)
                 break
-            except urllib2.URLError as last_exception:
-                if isinstance(last_exception, urllib2.HTTPError) and last_exception.code == 405:
-                    # TODO(f355): 2014-08-29 Remove this fallback after several weeks
-                    logger.warning("POST requests are unsupported. Please upgrade scheduler ASAP. Falling back to GET for now.")
-                    req = self._get(url, data)
-                    last_exception = None
-                    attempt -= 1
-                elif log_exceptions:
+            except urllib2.URLError, last_exception:
+                if log_exceptions:
                     logger.exception("Failed connecting to remote scheduler %r", self._host)
                 continue
         else:
@@ -93,18 +73,14 @@ class RemoteScheduler(Scheduler):
         # just one attemtps, keep-alive thread will keep trying anyway
         self._request('/api/ping', {'worker': worker}, attempts=1)
 
-    def add_task(self, worker, task_id, status=PENDING, runnable=False,
-                 deps=None, new_deps=None, expl=None, resources={},priority=0,
-                 family='', params={}):
+    def add_task(self, worker, task_id, status=PENDING, runnable=False, deps=None, expl=None, priority=0, family='', params={}):
         self._request('/api/add_task', {
             'task_id': task_id,
             'worker': worker,
             'status': status,
             'runnable': runnable,
             'deps': deps,
-            'new_deps': new_deps,
             'expl': expl,
-            'resources': resources,
             'priority': priority,
             'family': family,
             'params': params,
@@ -161,11 +137,8 @@ class RemoteSchedulerResponder(object):
     def __init__(self, scheduler):
         self._scheduler = scheduler
 
-    def add_task(self, worker, task_id, status, runnable, deps, new_deps, expl,
-                 resources=None, priority=0, family='', params={}, **kwargs):
-        return self._scheduler.add_task(
-            worker, task_id, status, runnable, deps, new_deps, expl,
-            resources, priority, family, params)
+    def add_task(self, worker, task_id, status, runnable, deps, expl, priority=0, family='', params={}, **kwargs):
+        return self._scheduler.add_task(worker, task_id, status, runnable, deps, expl, priority, family, params)
 
     def add_worker(self, worker, info, **kwargs):
         return self._scheduler.add_worker(worker, info)

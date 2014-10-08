@@ -23,14 +23,6 @@ def getpcmd(pid):
     p = os.popen(cmd, 'r')
     return p.readline().strip()
 
-def get_info(pid_dir):
-    # Check the name and pid of this process
-    my_pid = os.getpid()
-    my_cmd = getpcmd(my_pid)
-
-    pid_file = os.path.join(pid_dir, hashlib.md5(my_cmd).hexdigest()) + '.pid'
-
-    return my_pid, my_cmd, pid_file
 
 def acquire_for(pid_dir, num_available=1):
     ''' Makes sure the process is only run once at the same time with the same name.
@@ -41,18 +33,21 @@ def acquire_for(pid_dir, num_available=1):
     "/usr/bin/my_process --foo bar".
     '''
 
-    my_pid, my_cmd, pid_file = get_info(pid_dir)
-
+    # Check the name and pid of this process
+    my_pid = os.getpid()
+    my_cmd = getpcmd(my_pid)
     # Check if there is a pid file corresponding to this name
     if not os.path.exists(pid_dir):
         os.mkdir(pid_dir)
         os.chmod(pid_dir, 0777)
 
+    pidfile = os.path.join(pid_dir, hashlib.md5(my_cmd).hexdigest()) + '.pid'
+
     pids = set()
     pid_cmds = {}
-    if os.path.exists(pid_file):
+    if os.path.exists(pidfile):
         # There is such a file - read the pid and look up its process name
-        pids.update(filter(None, map(str.strip, open(pid_file))))
+        pids.update(filter(None, map(str.strip, open(pidfile))))
         pid_cmds = dict((pid, getpcmd(pid)) for pid in pids)
         matching_pids = filter(lambda pid: pid_cmds[pid] == my_cmd, pids)
 
@@ -67,11 +62,7 @@ def acquire_for(pid_dir, num_available=1):
 
     # Write pids
     pids.add(str(my_pid))
-    with open(pid_file, 'w') as f:
+    with open(pidfile, 'w') as f:
         f.writelines('%s\n' % (pid, ) for pid in filter(pid_cmds.__getitem__, pids))
-
-    # Make the file writable by all
-    s = os.stat(pid_file)
-    os.chmod(pid_file, s.st_mode | 0777)
 
     return True

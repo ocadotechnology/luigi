@@ -17,7 +17,6 @@ import json
 import os
 import atexit
 import mimetypes
-import posixpath
 import tornado.ioloop
 import tornado.netutil
 import tornado.web
@@ -30,7 +29,6 @@ import signal
 from rpc import RemoteSchedulerResponder
 import task_history
 import logging
-import warnings
 logger = logging.getLogger("luigi.server")
 
 
@@ -40,15 +38,12 @@ def _create_scheduler():
     remove_delay = config.getfloat('scheduler', 'remove-delay', 600.0)
     worker_disconnect_delay = config.getfloat('scheduler', 'worker-disconnect-delay', 60.0)
     state_path = config.get('scheduler', 'state-path', '/var/lib/luigi-server/state.pickle')
-    resources = config.getintdict('resources')
     if config.getboolean('scheduler', 'record_task_history', False):
         import db_task_history  # Needs sqlalchemy, thus imported here
         task_history_impl = db_task_history.DbTaskHistory()
     else:
         task_history_impl = task_history.NopHistory()
-    return scheduler.CentralPlannerScheduler(
-        retry_delay, remove_delay, worker_disconnect_delay, state_path, task_history_impl,
-        resources)
+    return scheduler.CentralPlannerScheduler(retry_delay, remove_delay, worker_disconnect_delay, state_path, task_history_impl)
 
 
 class RPCHandler(tornado.web.RequestHandler):
@@ -66,8 +61,6 @@ class RPCHandler(tornado.web.RequestHandler):
             self.write({"response": result})  # wrap all json response in a dictionary
         else:
             self.send_error(404)
-
-    post = get
 
 
 class BaseTaskHistoryHandler(tornado.web.RequestHandler):
@@ -106,12 +99,8 @@ class ByParamsHandler(BaseTaskHistoryHandler):
 
 class StaticFileHandler(tornado.web.RequestHandler):
     def get(self, path):
-        # Path checking taken from Flask's safe_join function:
-        # https://github.com/mitsuhiko/flask/blob/1d55b8983/flask/helpers.py#L563-L587
-        path = posixpath.normpath(path)
-        if os.path.isabs(path) or path.startswith(".."):
-            return self.send_error(404)
-
+        # TODO: this is probably not the right way to do it...
+        # TODO: security
         extension = os.path.splitext(path)[1]
         if extension in mimetypes.types_map:
             self.set_header("Content-Type", mimetypes.types_map[extension])
